@@ -4,7 +4,18 @@ using CuArrays, CUDAdrv, CUDAnative
 using FFTW, Statistics, Zygote
 using BenchmarkTools
 
-CuArrays.allowscalar(false)
+# CuArrays.allowscalar(false)
+
+function FFT_op(x, plan_mat)
+    return plan_mat * copy(x)
+end
+
+function IFFT_op(x, plan_mat)
+    return plan_mat * copy(x)
+end
+
+Zygote.@adjoint FFT_op(x) = Zygote.pullback(fft, x)
+Zygote.@adjoint IFFT_op(x) = Zygote.pullback(ifft, x)
 
 """
     build_fresnelPropagator(k, λ=0.1, Δ=0.1)  
@@ -15,13 +26,6 @@ Builds the Fresnel propagator:
 - `λ::Float`: wavelength
 - `Δ::Float`: propagation distance 
 """
-function build_fresnelPropagator!(fresnel_op, k, λ=0.1, z=0.1)
-    cons = -1.0f0 * im * Float32(λ * z * π)
-    fresnel_op .*= cons .* k .^ 2 
-    fresnel_op .= exp.(fresnel_op)
-    # return nothing
-    # return fresnel_op
-end
 
 function build_fresnelPropagator(k, λ=0.1, z=0.1)
     cons = -1.0f0 * im * Float32(λ * z * π)
@@ -37,12 +41,8 @@ Builds a transmission propagator
 - `V::Array`: 2-d array (potential slice).  
 - `σ::Float`: interaction parameter
 """
-function build_transmPropagator!(transm, V, σ=200.0f0)
-    transm .*= exp.( 1.0f0 * im * Float32(σ) * V) 
-end
-
 function build_transmPropagator(V, σ=200.0f0)
-    trans = exp.( 1.0f0 * im * Float32(σ) * V) 
+    trans = exp.(Float32(σ) * V) 
     return trans
 end
 
@@ -58,31 +58,48 @@ Iteratively propagates and transmits an initial wavefunction through a potential
 """
 function multislice!(psi, potential, wavelength, slice_thickness, interaction_strength)
     if isa(psi, CuArray)
-        k_arr = CuArrays.randn(Float32, size(psi))
-        Fresnel_op = CuArrays.ones(ComplexF32, size(psi))
-        transm = CuArrays.ones(ComplexF32, size(psi))
+        k_arr = CuArrays.ones(Float32, size(psi))
     else
-        k_arr = randn(Float32, size(psi))
-        Fresnel_op = ones(ComplexF32, size(psi))
-        transm = ones(ComplexF32, size(psi)) 
+        k_arr = ones(Float32, size(psi))
     end
-    build_fresnelPropagator!(Fresnel_op, k_arr, wavelength, slice_thickness)
-    FFT_op = plan_fft!(psi)
-    IFFT_op = plan_ifft!(psi)
+    Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
+    FFT_op = plan_fft!(psi, [1,2])
+    IFFT_op = plan_ifft!(psi, [1,2])
     for slice_idx in 1:size(potential,3)
-        build_transmPropagator!(transm, potential[:,:,slice_idx], interaction_strength)
-        psi .= IFFT_op * ( Fresnel_op .* (FFT_op * (psi .* transm) / sum(size(psi))))
+        trans_op = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
+        psi .= IFFT_op * ( Fresnel_op .* (FFT_op * (psi .* trans_op)))
     end
 end
 
 function multislice(psi, potential, wavelength, slice_thickness, interaction_strength)
-    k_arr = ones(size(psi))
+    if isa(potential, CuArray)
+        k_arr = CuArrays.ones(size(psi))
+    else
+        k_arr = ones(size(psi))
+    end
     Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
     for slice_idx in 1:size(potential,3)
-        trans = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
-        psi = ifft(Fresnel_op .* (fft(copy(psi) .* trans)))
+        trans_op = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
+        psi = ifft(Fresnel_op .* (fft(copy(psi) .* trans_op, [1,2])))
     end
     return psi
+end
+
+function multislice(psi, psi_buff, potential, wavelength, slice_thickness, interaction_strength)
+    if isa(potential, CuArray)
+        k_arr = CuArrays.ones(size(psi[:,:,1]))
+    else
+        k_arr = ones(size(psi[:,:,1])) 
+    end
+    Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
+    for slice_idx in 1:size(potential,3)-1
+        trans = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
+        psi_buff[:,:,slice_idx+1] = copy(psi_buff[:,:,slice_idx]) .* trans 
+        psi_buff[:,:,slice_idx+1] = fft(psi_buff[:,:,slice_idx+1])
+        psi_buff[:,:,slice_idx+1] = Fresnel_op .* copy(psi_buff[:,:,slice_idx+1])
+        psi_buff[:,:,slice_idx+1]= ifft(psi_buff[:,:,slice_idx+1])
+    end
+    return psi_buff
 end
 
 """
