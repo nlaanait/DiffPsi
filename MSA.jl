@@ -17,6 +17,115 @@ end
 Zygote.@adjoint FFT_op(x) = Zygote.pullback(fft, x)
 Zygote.@adjoint IFFT_op(x) = Zygote.pullback(ifft, x)
 
+
+mutable struct SimulationState
+    λ::Float32
+    sampling::Int
+    kmax::Float32
+    semi_angle::Float32
+    aperture::Dict
+    probe::Dict
+end
+
+function build_probe(simParams::SimulationState, probe_positions=[[0 ; 0]])
+    k_x, k_y = get_kspace_coordinates(simParams)
+    k_rad = (k_x .^ 2.f0 + k_y .^ 2.f0) .^ 0.5f0
+    aperture = get_aperture(simParams, k_rad)
+    phase_error = get_phase_error(simParams, k_rad)
+    
+    psi_k = aperture .* phase_error
+    if isa(probe_positions, CuArray)
+        psi_k = cu(psi_k)
+        k_x = cu(k_x)
+        k_y = cu(k_y)
+        psi_x = CuArrays.CuArray{ComplexF32}(undef, size(k_rad)...,length(probe_positions))
+    else
+        psi_x = Array{ComplexF32}(undef, size(k_rad)...,length(probe_positions))
+    end
+    FFT = plan_fft!(psi_x,[1,2])
+    IFFT = inv(FFT)
+    
+    phase_shift!(psi_x, k_x, k_y, psi_k, probe_positions)
+        
+    psi_x .= IFFT * psi_x
+    psi_x .= fftshift(psi_x, [1,2])
+    norms = sqrt.(sum(abs2, psi_x, dims=[1,2]))
+    psi_x ./= norms
+    return psi_x, psi_k
+end
+
+function phase_shift!(psi_x::Array, k_x::Array, k_y::Array, psi_k::Array, probe_positions::Array)
+    for (psi, pos) in zip(eachslice(psi_x; dims=3), probe_positions)
+        x, y = pos
+        kr = k_x .* x + k_y .* y
+        phase_shift = exp.( 2 * pi * im .* kr)
+        psi .= psi_k .* phase_shift
+    end
+end
+
+function phase_shift!(psi_x::CuArray, k_x::CuArray, k_y::CuArray, psi_k::CuArray, probe_positions::CuArray)
+    function ps_kernel!(psi_x, k_x, k_y, psi_k, probe_positions)
+        batch_idx = (blockIdx().z - 1) * blockDim().z + threadIdx().z 
+        row_idx   = (blockIdx().y - 1) * blockDim().y + threadIdx().y 
+        col_idx   = (blockIdx().x - 1) * blockDim().x + threadIdx().x 
+        x, y = probe_positions[batch_idx]
+        kr = k_x[row_idx, col_idx] * x + k_y[row_idx, col_idx] * y
+        phase_shift = CUDAnative.exp(ComplexF32(2.f0 * pi * im * kr))
+        psi_x[row_idx, col_idx, batch_idx] = psi_k[row_idx, col_idx] * phase_shift
+        return nothing
+    end
+    threads = (min(32, size(psi_x,1)), min(32, size(psi_x,2)), 1)
+    blocks = (ceil(Int, size(psi_x,1)/threads[1]), ceil(Int, size(psi_x, 2)/threads[2]), size(psi_x,3)) 
+    CuArrays.@sync begin
+        @info "Launching phase_shift_kernel"
+        @cuda threads=threads blocks=blocks ps_kernel!(psi_x, k_x, k_y, psi_k, probe_positions)
+        @info "Finished phase_shift_kernel"
+    end
+    synchronize()
+end
+
+
+function get_aperture(simParams, k_rad)
+    k_semi = simParams.semi_angle / simParams.λ
+    if simParams.aperture["type"] == "soft"
+        aperture = (1 .+ exp.( -2 .* simParams.aperture["factor"] .* (k_semi .- k_rad))) .^ (-1)
+    else
+        heaviside(x) = if x > 0; 0 elseif x == 0. 0.5; else 1. end
+        k_rad .-= k_semi
+        aperture = heaviside.(k_rad)
+    end
+    return aperture
+end
+    
+function get_kspace_coordinates(simParams::SimulationState)
+    k_start, k_stop, k_step = -simParams.kmax/2, simParams.kmax/2, simParams.sampling
+    k_y = [i for i in range(k_start,k_stop,length=k_step), j in range(k_start,k_stop,length=k_step)]
+    k_x = [j for i in range(k_start,k_stop,length=k_step), j in range(k_start,k_stop,length=k_step)]
+    return k_x, k_y
+end
+
+function get_phase_error(simParams::SimulationState, k_rad)
+    probe = simParams.probe
+    if probe["phase_error"] == "spherical"
+        C1 = probe["C1"]
+        C3 = probe["C3"]
+        C5 = probe["C5"]
+        if probe["Scherzer"] 
+            if C3 > 1.0 
+                C1 = (1.5 * C3 * simParams.λ)
+            else
+                @warn "Spherical Aberration is too small- Not using Scherzer condition"
+            end
+        end
+        λ = simParams.λ
+        chi = 2.f0 * π / λ * (-1.f0/2 * C1 * (k_rad * λ) ^ 2.f0 + 
+                            1.f0/4 * C3 * (k_rad * λ) ^ 4.f0 + 
+                            1.f0/6 * C5 * (k_rad * λ) ^ 6.f0)
+        return exp.(-1. *im * chi)
+    end
+end
+            
+
 """
     build_fresnelPropagator(k, λ=0.1, Δ=0.1)  
 Builds the Fresnel propagator:  
@@ -26,7 +135,6 @@ Builds the Fresnel propagator:
 - `λ::Float`: wavelength
 - `Δ::Float`: propagation distance 
 """
-
 function build_fresnelPropagator(k, λ=0.1, z=0.1)
     cons = -1.0f0 * im * Float32(λ * z * π)
     fresnel_op = exp.(cons .* k .^ 2)
