@@ -118,10 +118,10 @@ function get_phase_error(simParams::SimulationState, k_rad)
             end
         end
         λ = simParams.λ
-        chi = 2.f0 * π / λ * (-1.f0/2 * C1 * (k_rad * λ) ^ 2.f0 + 
-                            1.f0/4 * C3 * (k_rad * λ) ^ 4.f0 + 
-                            1.f0/6 * C5 * (k_rad * λ) ^ 6.f0)
-        return exp.(-1. *im * chi)
+        chi = 2.f0 * π / λ * (-1.f0/2 * C1 * (k_rad .* λ) .^ 2.f0 + 
+                            1.f0/4 * C3 * (k_rad .* λ) .^ 4.f0 + 
+                            1.f0/6 * C5 * (k_rad .* λ) .^ 6.f0)
+        return exp.(-1.f0 * im .* chi)
     end
 end
             
@@ -177,35 +177,37 @@ function multislice!(psi, potential, wavelength, slice_thickness, interaction_st
         trans_op = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
         psi .= IFFT_op * ( Fresnel_op .* (FFT_op * (psi .* trans_op)))
     end
-end
-
-function multislice(psi, potential, wavelength, slice_thickness, interaction_strength)
-    if isa(potential, CuArray)
-        k_arr = CuArrays.ones(size(psi))
-    else
-        k_arr = ones(size(psi))
-    end
-    Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
-    for slice_idx in 1:size(potential,3)
-        trans_op = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
-        psi = ifft(Fresnel_op .* (fft(copy(psi) .* trans_op, [1,2])))
-    end
-    return psi
+    psi .= FFT_op * psi
 end
 
 function multislice(psi, psi_buff, potential, wavelength, slice_thickness, interaction_strength)
     if isa(potential, CuArray)
-        k_arr = CuArrays.ones(size(psi[:,:,1]))
+        k_arr = CuArrays.ones(Float32, size(psi[:,:,1]))
     else
-        k_arr = ones(size(psi[:,:,1])) 
+        k_arr = ones(Float32, size(psi[:,:,1])) 
     end
     Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
-    for slice_idx in 1:size(potential,3)-1
+    psi_last = psi
+    for slice_idx in 1:size(potential,3)
         trans = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
-        psi_buff[:,:,slice_idx+1] = copy(psi_buff[:,:,slice_idx]) .* trans 
-        psi_buff[:,:,slice_idx+1] = fft(psi_buff[:,:,slice_idx+1])
-        psi_buff[:,:,slice_idx+1] = Fresnel_op .* copy(psi_buff[:,:,slice_idx+1])
-        psi_buff[:,:,slice_idx+1]= ifft(psi_buff[:,:,slice_idx+1])
+        psi_buff[:,:,slice_idx] = ifft(Fresnel_op .* fft(psi_last .* trans, [1,2]), [1,2])
+        psi_last = copy(psi_buff[:,:,slice_idx])
+    end
+    psi_out = copy(psi_buff)
+    return psi_out
+end
+
+function multislice_buffered(psi_buff, transm, wavelength, slice_thickness, interaction_strength)
+    if isa(transm, CuArray)
+        k_arr = CuArrays.ones(Float32, size(transm[:,:,1]))
+    else
+        k_arr = ones(Float32, size(transm[:,:,1])) 
+    end
+    Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
+    psi_last = copy(psi_buff[:,:,1])
+    for slice_idx in 1:size(transm,3)
+        psi_buff[:,:,slice_idx] = ifft(Fresnel_op .* fft(psi_last .* transm[:,:,slice_idx], [1,2]), [1,2])
+        psi_last = copy(psi_buff[:,:,slice_idx])
     end
     return psi_buff
 end
