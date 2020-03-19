@@ -25,6 +25,8 @@ mutable struct SimulationState
     semi_angle::Float32
     aperture::Dict
     probe::Dict
+    σ::Float32
+    slice_thickness::Float32
 end
 
 function build_probe(simParams::SimulationState, probe_positions=[[0 ; 0]])
@@ -51,14 +53,14 @@ function build_probe(simParams::SimulationState, probe_positions=[[0 ; 0]])
     psi_x .= fftshift(psi_x, [1,2])
     norms = sqrt.(sum(abs2, psi_x, dims=[1,2]))
     psi_x ./= norms
-    return psi_x, psi_k
+    return psi_x, psi_k, k_rad
 end
 
 function phase_shift!(psi_x::Array, k_x::Array, k_y::Array, psi_k::Array, probe_positions::Array)
     for (psi, pos) in zip(eachslice(psi_x; dims=3), probe_positions)
         x, y = pos
         kr = k_x .* x + k_y .* y
-        phase_shift = exp.( 2 * pi * im .* kr)
+        phase_shift = exp.(2.f0 * pi * im .* kr)
         psi .= psi_k .* phase_shift
     end
 end
@@ -102,6 +104,15 @@ function get_kspace_coordinates(simParams::SimulationState)
     k_y = [i for i in range(k_start,k_stop,length=k_step), j in range(k_start,k_stop,length=k_step)]
     k_x = [j for i in range(k_start,k_stop,length=k_step), j in range(k_start,k_stop,length=k_step)]
     return k_x, k_y
+end
+
+function get_probe_coordinates(simParams::SimulationState; fraction=0.5, origin=[0,0], grid_steps=[8,8])
+    grid_range_start = (0.5 .+ origin * simParams.sampling .- simParams.sampling * fraction/4) ./ 2
+    grid_range_stop = (0.5 .+ origin * simParams.sampling .+ simParams.sampling * fraction/4) ./ 2
+    x_range = range(grid_range_start[1], stop=grid_range_stop[1], length=grid_steps[1])
+    y_range = range(grid_range_start[2], stop=grid_range_stop[2], length=grid_steps[2])
+    probe_positions = [(-i, j) for i in x_range, j in y_range]
+    return probe_positions
 end
 
 function get_phase_error(simParams::SimulationState, k_rad)
@@ -150,7 +161,7 @@ Builds a transmission propagator
 - `σ::Float`: interaction parameter
 """
 function build_transmPropagator(V, σ=200.0f0)
-    trans = exp.(Float32(σ) * V) 
+    trans = exp.(1.0f0 * im * Float32(σ) * V) 
     return trans
 end
 
@@ -164,53 +175,40 @@ Iteratively propagates and transmits an initial wavefunction through a potential
 - `psi::Array{Complex}: 2-d array`
 - `potential::Array{Array{}}: array with N 2-d arrays`
 """
-function multislice!(psi, potential, wavelength, slice_thickness, interaction_strength)
-    if isa(psi, CuArray)
-        k_arr = CuArrays.ones(Float32, size(psi))
-    else
-        k_arr = ones(Float32, size(psi))
+function multislice!(psi, potential, k_arr, simParams::SimulationState)
+    Fresnel_op = build_fresnelPropagator(k_arr,simParams.λ, simParams.slice_thickness)
+    FFT_op = plan_fft!(psi[:,:,1], [1,2])
+    IFFT_op = plan_ifft!(psi[:,:,1], [1,2])
+    for psi_pos in eachslice(psi; dims=3)
+        interact!(psi_pos, potential, simParams, FFT_op, IFFT_op, Fresnel_op)
+        psi_pos .= FFT_op * psi_pos
     end
-    Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
-    FFT_op = plan_fft!(psi, [1,2])
-    IFFT_op = plan_ifft!(psi, [1,2])
-    for slice_idx in 1:size(potential,3)
-        trans_op = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
-        psi .= IFFT_op * ( Fresnel_op .* (FFT_op * (psi .* trans_op)))
-    end
-    psi .= FFT_op * psi
 end
 
-function multislice(psi, psi_buff, potential, wavelength, slice_thickness, interaction_strength)
-    if isa(potential, CuArray)
-        k_arr = CuArrays.ones(Float32, size(psi[:,:,1]))
-    else
-        k_arr = ones(Float32, size(psi[:,:,1])) 
-    end
-    Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
-    psi_last = psi
+function interact!(probe::SubArray, potential::Array, simParams, FFT_op, IFFT_op, Fresnel_op)
     for slice_idx in 1:size(potential,3)
-        trans = build_transmPropagator(potential[:,:,slice_idx], interaction_strength)
-        psi_buff[:,:,slice_idx] = ifft(Fresnel_op .* fft(psi_last .* trans, [1,2]), [1,2])
-        psi_last = copy(psi_buff[:,:,slice_idx])
-    end
-    psi_out = copy(psi_buff)
-    return psi_out
+        trans_op = build_transmPropagator(potential[:,:,slice_idx], simParams.σ)
+        probe .= IFFT_op * ( Fresnel_op .* (FFT_op * (probe .* trans_op)))
+    end 
 end
 
-function multislice_buffered(psi_buff, transm, wavelength, slice_thickness, interaction_strength)
-    if isa(transm, CuArray)
-        k_arr = CuArrays.ones(Float32, size(transm[:,:,1]))
-    else
-        k_arr = ones(Float32, size(transm[:,:,1])) 
+
+function multislice(psi, potential, k_arr, simParams::SimulationState) 
+    psi_buff = Zygote.Buffer(psi)
+    psi_buff[:] = psi[:]
+    Fresnel_op = build_fresnelPropagator(k_arr, simParams.λ, simParams.slice_thickness)
+    for probe_idx in 1:size(psi_buff,3)
+        psi_last = copy(psi_buff[:,:, probe_idx])
+        for slice_idx in 1:size(potential,3)
+            trans = build_transmPropagator(potential[:,:,slice_idx], simParams.σ) 
+            psi_buff[:,:,probe_idx] = ifft(Fresnel_op .* fft(psi_last .* trans, [1,2]), [1,2])
+            psi_last = copy(psi_buff[:,:,probe_idx])
+        end
+        psi_buff[:,:,probe_idx] = fft(psi_last)
     end
-    Fresnel_op = build_fresnelPropagator(k_arr, wavelength, slice_thickness)
-    psi_last = copy(psi_buff[:,:,1])
-    for slice_idx in 1:size(transm,3)
-        psi_buff[:,:,slice_idx] = ifft(Fresnel_op .* fft(psi_last .* transm[:,:,slice_idx], [1,2]), [1,2])
-        psi_last = copy(psi_buff[:,:,slice_idx])
-    end
-    return psi_buff
+    return copy(psi_buff)
 end
+
 
 """
     multislice_benchmark(device="cpu", k_size=(256,256), num_slices=256)
