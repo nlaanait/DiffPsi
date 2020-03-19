@@ -27,6 +27,7 @@ mutable struct SimulationState
     probe::Dict
     σ::Float32
     slice_thickness::Float32
+    bandwidth::Float32
 end
 
 function build_probe(simParams::SimulationState, probe_positions=[[0 ; 0]])
@@ -92,17 +93,31 @@ function get_aperture(simParams, k_rad)
     if simParams.aperture["type"] == "soft"
         aperture = (1 .+ exp.( -2 .* simParams.aperture["factor"] .* (k_semi .- k_rad))) .^ (-1)
     else
-        heaviside(x) = if x > 0; 0 elseif x == 0. 0.5; else 1. end
         k_rad .-= k_semi
         aperture = heaviside.(k_rad)
     end
     return aperture
 end
-    
+
+heaviside(x) = if x > 0; 0 elseif x == 0 0.5; else 1 end
+
+function get_bandwidth_mask(simParams::MSA.SimulationState)
+    radius = simParams.bandwidth * simParams.sampling
+    grid_start, grid_stop, grid_step = -simParams.sampling/2, simParams.sampling/2 - 1, 1
+    y = [i for i in range(grid_start,grid_stop,step=grid_step), j in range(grid_start,grid_stop,step=grid_step)]
+    x = [j for i in range(grid_start,grid_stop,step=grid_step), j in range(grid_start,grid_stop,step=grid_step)]
+    r = radius .- sqrt.( x .^ 2 + y .^ 2)
+    if simParams.aperture["type"] == "soft"
+        return 1 ./ (1 .+ exp.( -2 .* simParams.aperture["factor"] .* r)) 
+    else
+        return heaviside.(-r)
+    end
+end
+
 function get_kspace_coordinates(simParams::SimulationState)
-    k_start, k_stop, k_step = -simParams.kmax/2, simParams.kmax/2, simParams.sampling
-    k_y = [i for i in range(k_start,k_stop,length=k_step), j in range(k_start,k_stop,length=k_step)]
-    k_x = [j for i in range(k_start,k_stop,length=k_step), j in range(k_start,k_stop,length=k_step)]
+    k_start, k_stop, k_num = -simParams.kmax/2, simParams.kmax/2, simParams.sampling
+    k_y = [i for i in range(k_start,k_stop,length=k_num), j in range(k_start,k_stop,length=k_num)]
+    k_x = [j for i in range(k_start,k_stop,length=k_num), j in range(k_start,k_stop,length=k_num)]
     return k_x, k_y
 end
 
@@ -177,6 +192,8 @@ Iteratively propagates and transmits an initial wavefunction through a potential
 """
 function multislice!(psi, potential, k_arr, simParams::SimulationState)
     Fresnel_op = build_fresnelPropagator(k_arr,simParams.λ, simParams.slice_thickness)
+    Bandwidth_op = get_bandwidth_mask(simParams)
+    Fresnel_op .*= Bandwidth_op
     FFT_op = plan_fft!(psi[:,:,1], [1,2])
     IFFT_op = plan_ifft!(psi[:,:,1], [1,2])
     for psi_pos in eachslice(psi; dims=3)
@@ -188,15 +205,17 @@ end
 function interact!(probe::SubArray, potential::Array, simParams, FFT_op, IFFT_op, Fresnel_op)
     for slice_idx in 1:size(potential,3)
         trans_op = build_transmPropagator(potential[:,:,slice_idx], simParams.σ)
-        probe .= IFFT_op * ( Fresnel_op .* (FFT_op * (probe .* trans_op)))
+        probe .= IFFT_op * (Fresnel_op .* (FFT_op * (probe .* trans_op)))
     end 
 end
-
 
 function multislice(psi, potential, k_arr, simParams::SimulationState) 
     psi_buff = Zygote.Buffer(psi)
     psi_buff[:] = psi[:]
+    ## TODO: below causes an error
     Fresnel_op = build_fresnelPropagator(k_arr, simParams.λ, simParams.slice_thickness)
+    # Bandwidth_op = get_bandwidth_mask(simParams)
+    # Band_Fresnel_op = Bandwidth_op .* Fresnel_op
     for probe_idx in 1:size(psi_buff,3)
         psi_last = copy(psi_buff[:,:, probe_idx])
         for slice_idx in 1:size(potential,3)
