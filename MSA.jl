@@ -103,9 +103,9 @@ heaviside(x) = if x > 0; 0 elseif x == 0 0.5; else 1 end
 
 function get_bandwidth_mask(simParams::MSA.SimulationState)
     radius = simParams.bandwidth * simParams.sampling
-    grid_start, grid_stop, grid_step = -simParams.sampling/2, simParams.sampling/2 - 1, 1
-    y = [i for i in range(grid_start,grid_stop,step=grid_step), j in range(grid_start,grid_stop,step=grid_step)]
-    x = [j for i in range(grid_start,grid_stop,step=grid_step), j in range(grid_start,grid_stop,step=grid_step)]
+    grid_start, grid_stop, grid_num = -simParams.sampling/2, simParams.sampling/2 , simParams.sampling
+    y = [i for i in range(grid_start,grid_stop,length=grid_num), j in range(grid_start,grid_stop,length=grid_num)]
+    x = [j for i in range(grid_start,grid_stop,length=grid_num), j in range(grid_start,grid_stop,length=grid_num)]
     r = radius .- sqrt.( x .^ 2 + y .^ 2)
     if simParams.aperture["type"] == "soft"
         return 1 ./ (1 .+ exp.( -2 .* simParams.aperture["factor"] .* r)) 
@@ -192,42 +192,25 @@ Iteratively propagates and transmits an initial wavefunction through a potential
 """
 function multislice!(psi, potential, k_arr, simParams::SimulationState)
     Fresnel_op = build_fresnelPropagator(k_arr,simParams.λ, simParams.slice_thickness)
-    Bandwidth_op = get_bandwidth_mask(simParams)
-    Fresnel_op .*= Bandwidth_op
-    FFT_op = plan_fft!(psi[:,:,1], [1,2])
-    IFFT_op = plan_ifft!(psi[:,:,1], [1,2])
-    for psi_pos in eachslice(psi; dims=3)
-        interact!(psi_pos, potential, simParams, FFT_op, IFFT_op, Fresnel_op)
-        psi_pos .= FFT_op * psi_pos
+    FFT_op = plan_fft!(psi, [1,2])
+    IFFT_op = plan_ifft!(psi, [1,2])
+    for slice_idx in 1:size(potential, 3)
+        trans_op = trans_op = build_transmPropagator(potential[:,:,slice_idx], simParams.σ)
+        psi .= IFFT_op * (Fresnel_op .* (FFT_op * (psi .* trans_op))) 
     end
-end
-
-function interact!(probe::SubArray, potential::Array, simParams, FFT_op, IFFT_op, Fresnel_op)
-    for slice_idx in 1:size(potential,3)
-        trans_op = build_transmPropagator(potential[:,:,slice_idx], simParams.σ)
-        probe .= IFFT_op * (Fresnel_op .* (FFT_op * (probe .* trans_op)))
-    end 
+    psi .= FFT_op * psi
 end
 
 function multislice(psi, potential, k_arr, simParams::SimulationState) 
     psi_buff = Zygote.Buffer(psi)
-    psi_buff[:] = psi[:]
-    ## TODO: below causes an error
+    psi_buff[:,:,:] = psi[:,:,:]
     Fresnel_op = build_fresnelPropagator(k_arr, simParams.λ, simParams.slice_thickness)
-    # Bandwidth_op = get_bandwidth_mask(simParams)
-    # Band_Fresnel_op = Bandwidth_op .* Fresnel_op
-    for probe_idx in 1:size(psi_buff,3)
-        psi_last = copy(psi_buff[:,:, probe_idx])
-        for slice_idx in 1:size(potential,3)
-            trans = build_transmPropagator(potential[:,:,slice_idx], simParams.σ) 
-            psi_buff[:,:,probe_idx] = ifft(Fresnel_op .* fft(psi_last .* trans, [1,2]), [1,2])
-            psi_last = copy(psi_buff[:,:,probe_idx])
-        end
-        psi_buff[:,:,probe_idx] = fft(psi_last)
+    for slice_idx in 1:size(potential,3)
+        trans = build_transmPropagator(potential[:,:,slice_idx], simParams.σ) 
+        psi_buff = ifft(Fresnel_op .* fft(copy(psi_buff) .* trans, [1,2]), [1,2])
     end
-    return copy(psi_buff)
+    return fft(copy(psi_buff),[1,2])
 end
-
 
 """
     multislice_benchmark(device="cpu", k_size=(256,256), num_slices=256)
