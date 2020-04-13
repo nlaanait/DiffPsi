@@ -2,20 +2,6 @@ module MSA
 
 using CuArrays, CUDAdrv, CUDAnative
 using FFTW, Statistics, Zygote
-using BenchmarkTools
-
-# CuArrays.allowscalar(false)
-
-function FFT_op(x, plan_mat)
-    return plan_mat * copy(x)
-end
-
-function IFFT_op(x, plan_mat)
-    return plan_mat * copy(x)
-end
-
-Zygote.@adjoint FFT_op(x) = Zygote.pullback(fft, x)
-Zygote.@adjoint IFFT_op(x) = Zygote.pullback(ifft, x)
 
 
 mutable struct SimulationState
@@ -26,29 +12,40 @@ mutable struct SimulationState
     aperture::Dict
     probe::Dict
     σ::Float32
-    slice_thickness::Float32
+    Δ::Float32
     bandwidth::Float32
 end
 
-function build_probe(simParams::SimulationState, probe_positions=[[0 ; 0]])
+mutable struct Scan
+    x::Union{Array, CuArray}
+    y::Union{Array, CuArray}
+end
+
+function cu(scan::Scan)
+    return Scan(CuArrays.cu(scan.x), CuArrays.cu(scan.y))
+end
+
+function build_probe(simParams::SimulationState, 
+                     pos=Scan(zeros(Float32, 1, 1, 1), zeros(Float32, 1, 1, 1)))
+    # build probe in k-space
     k_x, k_y = get_kspace_coordinates(simParams)
     k_rad = (k_x .^ 2.f0 + k_y .^ 2.f0) .^ 0.5f0
     aperture = get_aperture(simParams, k_rad)
     phase_error = get_phase_error(simParams, k_rad)
-    
     psi_k = aperture .* phase_error
-    if isa(probe_positions, CuArray)
-        psi_k = cu(psi_k)
-        k_x = cu(k_x)
-        k_y = cu(k_y)
-        psi_x = CuArrays.CuArray{ComplexF32}(undef, size(k_rad)...,length(probe_positions))
+
+    # transform probe to real space
+    if isa(pos.x, CuArray)
+        @info "Executing on GPU"
+        psi_x = CuArrays.CuArray{ComplexF32}(undef, size(k_rad)...,length(pos.x))
+        k_rad, psi_k = map(CuArrays.cu, (k_rad, psi_k))
     else
-        psi_x = Array{ComplexF32}(undef, size(k_rad)...,length(probe_positions))
+        psi_x = Array{ComplexF32}(undef, size(k_rad)...,length(pos.x))
     end
     FFT = plan_fft!(psi_x,[1,2])
     IFFT = inv(FFT)
     
-    phase_shift!(psi_x, k_x, k_y, psi_k, probe_positions)
+    phase_shift!(psi_x, k_x, k_y, psi_k, pos)
         
     psi_x .= IFFT * psi_x
     psi_x .= fftshift(psi_x, [1,2])
@@ -57,13 +54,19 @@ function build_probe(simParams::SimulationState, probe_positions=[[0 ; 0]])
     return psi_x, psi_k, k_rad
 end
 
-function phase_shift!(psi_x::Array, k_x::Array, k_y::Array, psi_k::Array, probe_positions::Array)
-    for (psi, pos) in zip(eachslice(psi_x; dims=3), probe_positions)
-        x, y = pos
-        kr = k_x .* x + k_y .* y
-        phase_shift = exp.(2.f0 * pi * im .* kr)
-        psi .= psi_k .* phase_shift
-    end
+function phase_shift!(psi_x::Array, psi_k, k_x, k_y, pos::Scan)
+    psi_k, k_x, k_y = map( x -> repeat(x, outer=(1, 1, length(pos.x))), (psi_k, k_x, k_y))
+    kr = k_x .* pos.x + k_y .* pos.y
+    phase_shift = exp.(2.f0 * pi * im .* kr)
+    psi_x .= psi_k .* phase_shift
+end
+
+function phase_shift!(psi_x::CuArray, psi_k, k_x, k_y, scan::Scan)
+    psi_k, k_x, k_y = map( x -> CuArrays.cu(x), (psi_k, k_x, k_y))
+    psi_k, k_x, k_y = map( x -> repeat(x, outer=(1, 1, length(scan.x))), (psi_k, k_x, k_y))
+    kr = k_x .* scan.x + k_y .* scan.y
+    phase_shift = exp.(2.f0 * pi * im .* kr)
+    psi_x .= psi_k .* phase_shift
 end
 
 function phase_shift!(psi_x::CuArray, k_x::CuArray, k_y::CuArray, psi_k::CuArray, probe_positions::CuArray)
@@ -130,6 +133,20 @@ function get_probe_coordinates(simParams::SimulationState; fraction=0.5, origin=
     return probe_positions
 end
 
+function buildScan(simParams::MSA.SimulationState; fraction=0.5, origin=[0,0], grid_steps=[8,8])
+    grid_range_start = (0.5 .+ origin * simParams.sampling .- simParams.sampling * fraction/4) ./ 2
+    grid_range_stop = (0.5 .+ origin * simParams.sampling .+ simParams.sampling * fraction/4) ./ 2
+    x_range = range(grid_range_start[1], stop=grid_range_stop[1], length=grid_steps[1])
+    y_range = range(grid_range_start[2], stop=grid_range_stop[2], length=grid_steps[2])
+    probe_positions = [[-i, j] for i in x_range, j in y_range]
+    probe_positions = hcat(probe_positions...)
+    x, y = probe_positions[1,:], probe_positions[2,:]
+    x = reshape(x, 1, 1, :)
+    y = reshape(y, 1, 1, :)
+    scan = Scan(x, y)
+    return scan
+end
+
 function get_phase_error(simParams::SimulationState, k_rad)
     probe = simParams.probe
     if probe["phase_error"] == "spherical"
@@ -191,7 +208,7 @@ Iteratively propagates and transmits an initial wavefunction through a potential
 - `potential::Array{Array{}}: array with N 2-d arrays`
 """
 function multislice!(psi, potential, k_arr, simParams::SimulationState)
-    Fresnel_op = build_fresnelPropagator(k_arr,simParams.λ, simParams.slice_thickness)
+    Fresnel_op = build_fresnelPropagator(k_arr,simParams.λ, simParams.Δ)
     FFT_op = plan_fft!(psi, [1,2])
     IFFT_op = plan_ifft!(psi, [1,2])
     for slice_idx in 1:size(potential, 3)
@@ -204,7 +221,7 @@ end
 function multislice(psi, potential, k_arr, simParams::SimulationState) 
     psi_buff = Zygote.Buffer(psi)
     psi_buff[:,:,:] = psi[:,:,:]
-    Fresnel_op = build_fresnelPropagator(k_arr, simParams.λ, simParams.slice_thickness)
+    Fresnel_op = build_fresnelPropagator(k_arr, simParams.λ, simParams.Δ)
     for slice_idx in 1:size(potential,3)
         trans = build_transmPropagator(potential[:,:,slice_idx], simParams.σ) 
         psi_buff = ifft(Fresnel_op .* fft(copy(psi_buff) .* trans, [1,2]), [1,2])
@@ -212,28 +229,7 @@ function multislice(psi, potential, k_arr, simParams::SimulationState)
     return fft(copy(psi_buff),[1,2])
 end
 
-"""
-    multislice_benchmark(device="cpu", k_size=(256,256), num_slices=256)
-Runs benchmarks of multislice!()  
-The `device` keyarg specifies the platform: "cpu" or "gpu"
-"""
-function multislice_benchmark(device="cpu", k_size=(256, 256), num_slices=256)
-    if device == "cpu"
-        psi = ones(ComplexF32, k_size)
-        potential = ones(Float32, (k_size..., num_slices))
-    elseif device == "gpu"
-        psi = CuArrays.ones(ComplexF32, k_size)
-        potential = CuArrays.ones(ComplexF32, (k_size..., num_slices))
-    else
-        error("Provided device $device is not available.")
-    end
-    @info("Running $device Benchmarks... \n Wavefunction dims:$k_size, Potential slices:$num_slices")
-   
-    bench = @benchmark multislice!($psi, $potential, 0.1, 0.1, 10)
-    println("Time Elapsed:
-        max = $(round(maximum(bench.times)*1e-9; digits=4)) s, 
-        min = $(round(minimum(bench.times)*1e-9; digits=4)) s,
-        std = $(round(std(bench.times)*1e-9; digits=4)) s")
-end
 
+
+# module ends
 end
