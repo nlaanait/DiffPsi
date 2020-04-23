@@ -1,4 +1,4 @@
-module MSA
+# module MSA
 
 using CuArrays, CUDAdrv, CUDAnative
 using FFTW, Statistics, Zygote
@@ -51,6 +51,7 @@ function build_probe(simParams::SimulationState,
     psi_x .= fftshift(psi_x, [1,2])
     norms = sqrt.(sum(abs2, psi_x, dims=[1,2]))
     psi_x ./= norms
+    psi_k = Complex{Float32}.(psi_k)
     return psi_x, psi_k, k_rad
 end
 
@@ -90,11 +91,10 @@ function phase_shift!(psi_x::CuArray, k_x::CuArray, k_y::CuArray, psi_k::CuArray
     synchronize()
 end
 
-
 function get_aperture(simParams, k_rad)
     k_semi = simParams.semi_angle / simParams.λ
     if simParams.aperture["type"] == "soft"
-        aperture = (1 .+ exp.( -2 .* simParams.aperture["factor"] .* (k_semi .- k_rad))) .^ (-1)
+        aperture = (1.f0 .+ exp.( -2.f0 .* simParams.aperture["factor"] .* (k_semi .- k_rad))) .^ (-1.f0)
     else
         k_rad .-= k_semi
         aperture = heaviside.(k_rad)
@@ -102,9 +102,9 @@ function get_aperture(simParams, k_rad)
     return aperture
 end
 
-heaviside(x) = if x > 0; 0 elseif x == 0 0.5; else 1 end
+heaviside(x) = if x > 0; 0.f0 elseif x == 0 0.5f0; else 1.f0 end
 
-function get_bandwidth_mask(simParams::MSA.SimulationState)
+function get_bandwidth_mask(simParams::SimulationState)
     radius = simParams.bandwidth * simParams.sampling
     grid_start, grid_stop, grid_num = -simParams.sampling/2, simParams.sampling/2 , simParams.sampling
     y = [i for i in range(grid_start,grid_stop,length=grid_num), j in range(grid_start,grid_stop,length=grid_num)]
@@ -133,7 +133,7 @@ function get_probe_coordinates(simParams::SimulationState; fraction=0.5, origin=
     return probe_positions
 end
 
-function buildScan(simParams::MSA.SimulationState; fraction=0.5, origin=[0,0], grid_steps=[8,8])
+function buildScan(simParams::SimulationState; fraction=0.5, origin=[0,0], grid_steps=[8,8])
     grid_range_start = (0.5 .+ origin * simParams.sampling .- simParams.sampling * fraction/4) ./ 2
     grid_range_stop = (0.5 .+ origin * simParams.sampling .+ simParams.sampling * fraction/4) ./ 2
     x_range = range(grid_range_start[1], stop=grid_range_stop[1], length=grid_steps[1])
@@ -201,13 +201,13 @@ end
     multislice!(psi, potential, wavelength, slice_thickness, interaction_strength)
 Iteratively propagates and transmits an initial wavefunction through a potential.  
    ѱ_{N+1} = 𝓕^{-1} { 𝒫 𝓕 { 𝓣_{N} ѱ_{N} }}  
-𝒫: Fresnel propagator is calculated with `MSA.build_fresnelPropagator`   
-𝓣: transmission propagator is calculated with `MSA.build_transmPropagator`  
+𝒫: Fresnel propagator is calculated with `build_fresnelPropagator`   
+𝓣: transmission propagator is calculated with `build_transmPropagator`  
 # Arguments
 - `psi::Array{Complex}: 2-d array`
 - `potential::Array{Array{}}: array with N 2-d arrays`
 """
-function multislice!(psi, potential, k_arr, simParams::SimulationState)
+function multislice!(psi::Union{Array, CuArray}, potential, k_arr, simParams::SimulationState)
     Fresnel_op = build_fresnelPropagator(k_arr,simParams.λ, simParams.Δ)
     FFT_op = plan_fft!(psi, [1,2])
     IFFT_op = plan_ifft!(psi, [1,2])
@@ -216,20 +216,4 @@ function multislice!(psi, potential, k_arr, simParams::SimulationState)
         psi .= IFFT_op * (Fresnel_op .* (FFT_op * (psi .* trans_op))) 
     end
     psi .= FFT_op * psi
-end
-
-function multislice(psi, potential, k_arr, simParams::SimulationState) 
-    psi_buff = Zygote.Buffer(psi)
-    psi_buff[:,:,:] = psi[:,:,:]
-    Fresnel_op = build_fresnelPropagator(k_arr, simParams.λ, simParams.Δ)
-    for slice_idx in 1:size(potential,3)
-        trans = build_transmPropagator(potential[:,:,slice_idx], simParams.σ) 
-        psi_buff = ifft(Fresnel_op .* fft(copy(psi_buff) .* trans, [1,2]), [1,2])
-    end
-    return fft(copy(psi_buff),[1,2])
-end
-
-
-
-# module ends
 end

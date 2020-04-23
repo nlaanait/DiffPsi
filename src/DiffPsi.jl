@@ -1,9 +1,11 @@
 module DiffPsi
 
-using Zygote, Flux, FFTW
+using Zygote, Flux, FFTW, LinearAlgebra
+using Flux: Optimise
 
-include("MSA.jl")
-include("DiffMSA.jl")
-include("Utils.jl")
+include("msa.jl")
+include("grad_msa.jl")
+include("utils.jl")
+
 
 end
