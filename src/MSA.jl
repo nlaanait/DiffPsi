@@ -1,7 +1,7 @@
 # module MSA
 
 using CuArrays, CUDAdrv, CUDAnative
-using FFTW, Statistics, Zygote
+using FFTW, Statistics
 
 
 mutable struct SimulationState

@@ -1,15 +1,39 @@
+using Zygote
+using Zygote: @adjoint, nograd
+
 include("msa.jl")
 
-# function FFT_op(x, plan_mat)
-#     return plan_mat * copy(x)
+# function get_fftplans(arr)
+#     nograd() do
+#     fft_plan = plan_fft(arr, [1,2])
+#     ifft_plan = plan_ifft(arr, [1,2])
+#     return fft_plan, ifft_plan
+#     end
 # end
+function get_fft_plan(arr; dims=[1,2])
+    return plan_fft(arr, dims)
+end
 
-# function IFFT_op(x, plan_mat)
-#     return plan_mat * copy(x)
-# end
+function get_ifft_plan(arr; dims=[1,2])
+    return plan_ifft(arr, dims)
+end
 
-# Zygote.@adjoint FFT_op(x) = Zygote.pullback(fft, x)
-# Zygote.@adjoint IFFT_op(x) = Zygote.pullback(ifft, x)
+# fft_plan = plan_fft(ones(ComplexF32, (128, 128, 256)), [1,2])
+# ifft_plan = plan_ifft(ones(ComplexF32, (128, 128, 256)), [1,2])
+
+function FFT_op(x, fft_plan)
+    return fft_plan * x
+end
+
+function IFFT_op(x, ifft_plan)
+    return ifft_plan * x
+end
+
+@adjoint get_fft_plan(arr; dims=[1,2]) = get_fft_plan(arr; dims=[1,2]), Δ -> nothing
+@adjoint get_ifft_plan(arr; dims=[1,2]) = get_ifft_plan(arr; dims=[1,2]), Δ -> nothing
+@adjoint FFT_op(x, fft_plan) = Zygote.pullback(fft, x)
+@adjoint IFFT_op(x), ifft_plan = Zygote.pullback(ifft, x)
+Zygote.refresh()
 
 # function fft_shift(x)
 #     Zygote.nograd() do
@@ -70,11 +94,25 @@ function build_probes(psi_k, k_x, k_y, pos::Scan)
     return copy(psi)
 end
 
+# function multislice(psi::Zygote.Buffer, potential, k_arr, simParams::SimulationState) 
+#     Fresnel_op = build_fresnelPropagator(k_arr, simParams.λ, simParams.Δ)
+#     for slice_idx in 1:size(potential,3)
+#         trans = build_transmPropagator(potential[:,:,slice_idx], simParams.σ) 
+#         psi = ifft(Fresnel_op .* fft(copy(psi) .* trans, [1,2]), [1,2])
+#     end
+#     return fft(copy(psi),[1,2])
+# end
+
 function multislice(psi::Zygote.Buffer, potential, k_arr, simParams::SimulationState) 
     Fresnel_op = build_fresnelPropagator(k_arr, simParams.λ, simParams.Δ)
+    fft_plan = get_fft_plan(copy(psi))
+    ifft_plan = get_ifft_plan(copy(psi))
+    # fft_plan = plan_fft(copy(psi), [1,2])
+    # ifft_plan = plan_ifft(copy(psi), [1,2])
     for slice_idx in 1:size(potential,3)
-        trans = build_transmPropagator(potential[:,:,slice_idx], simParams.σ) 
-        psi = ifft(Fresnel_op .* fft(copy(psi) .* trans, [1,2]), [1,2])
+        trans = build_transmPropagator(potential[:,:,slice_idx], simParams.σ)
+        psi = FFT_op(copy(psi) .* trans, fft_plan)
+        psi = IFFT_op(Fresnel_op .* copy(psi), ifft_plan)
     end
     return fft(copy(psi),[1,2])
 end
@@ -86,7 +124,7 @@ function sgd_update!(model::ForwardModel, grads, η = 0.01; verbose=false)
             ∂ѱ=$(round.(grads.phase; digits=2))")
         @info("before sgd update:
         V'=$(round.(model.potential; digits=2))
-        ѱ'=$(round.(model.phase; digits=2))")
+  ;      ѱ'=$(round.(model.phase; digits=2))")
     end
     model.phase .-= η .* grads.phase
     model.potential .-= η .* grads.potential

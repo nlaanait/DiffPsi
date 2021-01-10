@@ -1,4 +1,4 @@
-using NPZ, Zygote
+using NPZ, BenchmarkTools, Statistics
 
 include("../src/DiffPsi.jl")
 using .DiffPsi
@@ -13,14 +13,14 @@ probe = Dict("phase_error" => "spherical",
              "C5" => 3e3, 
              "Scherzer" => false)
 sigma = 0.01
-num_slices = 3
+num_slices = 16
 slice_thickness = 0.25
 bandlimit = 1.0
 simParams = DiffPsi.SimulationState(0.05, 128, 4, 0.02, soft_aperture, probe, 
                                     sigma, slice_thickness, bandlimit)
 
 # initialize scan parameters
-scan = DiffPsi.buildScan(simParams)
+scan = DiffPsi.buildScan(simParams; grid_steps=[16,16])
 
 # load target potential
 v_file = npzread("data/potential_445.npy")
@@ -75,6 +75,19 @@ grads = grads[1][]
 ∂arg(ѱ): Type=$(typeof(grads.phase)) & Shape=$(size(grads.phase))")
 @test true
 # grad_plot(grads)
+
+# benchmarks
+@info "Benchmarking on CPU"
+bench = @benchmark gradient($model) do m
+                   return DiffPsi.loss(m, $psi2_trg, $init_data)
+end
+    println("Time Elapsed:
+        max = $(round(maximum(bench.times)*1e-9; digits=4)) s, 
+        min (typical runtime) = $(round(minimum(bench.times)*1e-9; digits=4)) s,
+        mean = $(round(mean(bench.times)*1e-9; digits=4)) s, 
+        std = $(round(std(bench.times)*1e-9; digits=4)) s")
+@test true
+
 
 @info("Optimizing ∂F...")
 
