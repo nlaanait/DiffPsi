@@ -1,5 +1,5 @@
 using Zygote
-using Zygote: @adjoint, nograd
+using Zygote: @adjoint, @nograd
 
 include("msa.jl")
 
@@ -29,11 +29,11 @@ function IFFT_op(x, ifft_plan)
     return ifft_plan * x
 end
 
-@adjoint get_fft_plan(arr; dims=[1,2]) = get_fft_plan(arr; dims=[1,2]), Δ -> nothing
-@adjoint get_ifft_plan(arr; dims=[1,2]) = get_ifft_plan(arr; dims=[1,2]), Δ -> nothing
-@adjoint FFT_op(x, fft_plan) = Zygote.pullback(fft, x)
-@adjoint IFFT_op(x), ifft_plan = Zygote.pullback(ifft, x)
-Zygote.refresh()
+# @adjoint get_fft_plan(arr; dims=[1,2]) = get_fft_plan(arr; dims=[1,2]), Δ -> nothing
+# @adjoint get_ifft_plan(arr; dims=[1,2]) = get_ifft_plan(arr; dims=[1,2]), Δ -> nothing
+# @adjoint FFT_op(x, fft_plan) = Zygote.pullback(fft, x)
+# @adjoint IFFT_op(x), ifft_plan = Zygote.pullback(ifft, x)
+# Zygote.refresh()
 
 # function fft_shift(x)
 #     Zygote.nograd() do
